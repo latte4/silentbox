@@ -60,13 +60,9 @@ pub async fn serve_fs_and_connect(
     })?;
     let actual_port = listener.local_addr()?.port();
 
-    println!("WebDAV サーバを http://127.0.0.1:{actual_port}/ で起動しました。");
-    println!("ドライブ {drive} を割り当てます...");
-
-    connect_drive(drive, actual_port)?;
-    println!("{drive} を割り当てました。Ctrl+C で終了します（終了時に切断します）。");
-
-    let server = tokio::spawn(async move {
+    // 受付ループは `net use` より先に動かす。`net use` は割り当ての途中で
+    // OPTIONS / PROPFIND を送ってくるため、応答できないとシステムエラー 67 で失敗する。
+    let mut server = tokio::spawn(async move {
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(v) => v,
@@ -88,9 +84,24 @@ pub async fn serve_fs_and_connect(
         }
     });
 
+    println!("WebDAV サーバを http://127.0.0.1:{actual_port}/ で起動しました。");
+    println!("ドライブ {drive} を割り当てます...");
+
+    // `net use` は同期で待つので、ランタイムを塞がないよう別スレッドで呼ぶ。
+    let drive_owned = drive.to_string();
+    let connected = tokio::task::spawn_blocking(move || connect_drive(&drive_owned, actual_port))
+        .await
+        .map_err(|e| anyhow::anyhow!("ドライブ割り当て処理が異常終了しました: {e}"))
+        .and_then(|r| r);
+    if let Err(e) = connected {
+        server.abort();
+        return Err(e);
+    }
+    println!("{drive} を割り当てました。Ctrl+C で終了します（終了時に切断します）。");
+
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
-        _ = server => {}
+        _ = &mut server => {}
     }
 
     disconnect_drive(drive);
