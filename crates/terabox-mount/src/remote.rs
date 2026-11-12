@@ -19,6 +19,13 @@ use terabox_core::vfs::{base_name, normalize_path, parent_path, RemoteFs, Remote
 /// キャッシュの有効期間。短すぎると API を叩きすぎ、長すぎると更新が見えない。
 const CACHE_TTL: Duration = Duration::from_secs(15);
 
+/// 変更の直後、サーバの一覧に反映されるまで手元の情報で補う期間。
+///
+/// `/api/list` は作成・アップロード・改名・削除を数秒遅れて返すことがある
+/// （実測）。その間に「無い」と答えると、エクスプローラーが「この項目は
+/// 見つかりませんでした」で止まり、再試行を繰り返す。
+const OVERLAY_TTL: Duration = Duration::from_secs(60);
+
 /// 容量情報のキャッシュ有効期間。
 ///
 /// 残量は書き込みで変わるが、毎回 `/api/quota` を叩くと重い。30 秒で取り替える。
@@ -56,6 +63,36 @@ struct CacheEntry {
     fetched: Instant,
 }
 
+/// 手元で把握している直近の変更 1 件。
+#[derive(Clone)]
+struct OverlayItem {
+    /// `Some` なら「ある」、`None` なら「無い」（削除・改名元）。
+    entry: Option<FsEntry>,
+    /// まだ TeraBox に送っていない空ファイル。
+    placeholder: bool,
+    at: Instant,
+}
+
+/// 手元で作るエントリ（サーバの値が届くまでの代わり）。
+fn local_entry(path: &str, is_dir: bool, size: u64) -> FsEntry {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    FsEntry {
+        fs_id: String::new(),
+        server_filename: base_name(path),
+        path: normalize_path(path),
+        isdir: is_dir,
+        size,
+        server_mtime: now,
+        server_ctime: now,
+        md5: String::new(),
+        thumbs: None,
+        category: None,
+    }
+}
+
 /// 1 回分の容量情報。
 #[derive(Debug, Clone, Copy)]
 pub struct VolumeUsage {
@@ -69,6 +106,8 @@ pub struct VolumeUsage {
 pub struct TeraBoxFs {
     api: ApiClient,
     cache: Mutex<HashMap<String, CacheEntry>>,
+    /// 直近の変更（パス -> 状態）。`OVERLAY_TTL` の間だけ一覧に重ねる。
+    overlay: Mutex<HashMap<String, OverlayItem>>,
     /// 容量の短期キャッシュ。`None` は「まだ取れていない」。
     quota: Mutex<Option<(VolumeUsage, Instant)>>,
     /// dlink のキャッシュ（平文パス -> 署名付き URL）。
@@ -94,6 +133,7 @@ impl TeraBoxFs {
         Self {
             api,
             cache: Mutex::new(HashMap::new()),
+            overlay: Mutex::new(HashMap::new()),
             quota: Mutex::new(None),
             dlinks: Mutex::new(HashMap::new()),
             downloader,
@@ -168,8 +208,85 @@ impl TeraBoxFs {
         *guard = None;
     }
 
-    /// ディレクトリ一覧を取得する（キャッシュ経由）。
+    /// ディレクトリ一覧（サーバの値に直近の変更を重ねたもの）。
     async fn entries(&self, dir: &str) -> Result<Vec<FsEntry>, TbxError> {
+        let key = normalize_path(dir);
+        let list = match self.server_entries(&key).await {
+            Ok(list) => list,
+            // 作ったばかりのフォルダは、まだサーバの一覧に無いことがある。
+            Err(TbxError::Api(ref e)) if e.errno == -9 && self.overlay_exists(&key) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        Ok(self.apply_overlay(&key, list))
+    }
+
+    /// 変更を記録する。
+    fn note(&self, path: &str, entry: Option<FsEntry>, placeholder: bool) {
+        let mut ov = self.overlay.lock().unwrap_or_else(|e| e.into_inner());
+        ov.insert(
+            normalize_path(path),
+            OverlayItem {
+                entry,
+                placeholder,
+                at: Instant::now(),
+            },
+        );
+    }
+
+    /// 記録済みの状態。`Some(None)` は「無いと分かっている」。
+    fn overlay_lookup(&self, path: &str) -> Option<Option<FsEntry>> {
+        let mut ov = self.overlay.lock().unwrap_or_else(|e| e.into_inner());
+        ov.retain(|_, v| v.at.elapsed() < OVERLAY_TTL);
+        ov.get(&normalize_path(path)).map(|v| v.entry.clone())
+    }
+
+    fn overlay_exists(&self, path: &str) -> bool {
+        matches!(self.overlay_lookup(path), Some(Some(_)))
+    }
+
+    fn is_placeholder(&self, path: &str) -> bool {
+        let ov = self.overlay.lock().unwrap_or_else(|e| e.into_inner());
+        ov.get(&normalize_path(path))
+            .map(|v| v.placeholder && v.at.elapsed() < OVERLAY_TTL)
+            .unwrap_or(false)
+    }
+
+    /// 消したフォルダの配下の記録を捨てる。
+    fn forget_under(&self, dir: &str) {
+        let prefix = format!("{}/", normalize_path(dir));
+        let mut ov = self.overlay.lock().unwrap_or_else(|e| e.into_inner());
+        ov.retain(|k, _| !k.starts_with(&prefix));
+    }
+
+    /// サーバの一覧に直近の変更を重ねる。
+    fn apply_overlay(&self, dir: &str, mut list: Vec<FsEntry>) -> Vec<FsEntry> {
+        let mut ov = self.overlay.lock().unwrap_or_else(|e| e.into_inner());
+        ov.retain(|_, v| v.at.elapsed() < OVERLAY_TTL);
+        for (path, item) in ov.iter() {
+            if parent_path(path) != dir {
+                continue;
+            }
+            let name = base_name(path);
+            let pos = list.iter().position(|e| e.display_name() == name);
+            match (&item.entry, pos) {
+                (Some(e), None) => list.push(e.clone()),
+                // サーバの値が古い（上書き前のサイズなど）ときは手元を優先する。
+                (Some(e), Some(i))
+                    if item.placeholder || list[i].size != e.size || list[i].isdir != e.isdir =>
+                {
+                    list[i] = e.clone()
+                }
+                (None, Some(i)) => {
+                    list.remove(i);
+                }
+                _ => {}
+            }
+        }
+        list
+    }
+
+    /// サーバのディレクトリ一覧（キャッシュ経由）。
+    async fn server_entries(&self, dir: &str) -> Result<Vec<FsEntry>, TbxError> {
         let key = normalize_path(dir);
         {
             let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -210,6 +327,9 @@ impl TeraBoxFs {
                 thumbs: None,
                 category: None,
             }));
+        }
+        if let Some(known) = self.overlay_lookup(&p) {
+            return Ok(known);
         }
         let parent = parent_path(&p);
         let name = base_name(&p);
@@ -301,11 +421,13 @@ impl RemoteFs for TeraBoxFs {
 
     async fn write(&self, path: &str, data: &[u8]) -> Result<(), TbxError> {
         let normalized = normalize_path(path);
+        let was_placeholder = self.is_placeholder(&normalized);
 
         // 既存ファイルがあれば先に消す。`/api/create` は同名パスを上書きせず
         // `name_20261106_234426.bin` のように別名で作る（実測）。削除してから
         // 送ると同じパスに置ける（実測で確認済み）。
-        if self.find(&normalized).await?.is_some() {
+        // 下準備の空ファイルはサーバに無いので消さない。
+        if !was_placeholder && self.find(&normalized).await?.is_some() {
             self.api.delete(&[normalized.clone()]).await?;
             // 削除の反映を待つ。直後に create すると、まだ残っているものとして
             // 別名が付くことがある。
@@ -331,11 +453,36 @@ impl RemoteFs for TeraBoxFs {
         // 書いた後は親ディレクトリのキャッシュと容量を捨てる（削除・作成と同じ理由）。
         self.invalidate(&parent_path(&normalized));
         self.invalidate_usage();
+        if result.is_ok() {
+            self.note(&normalized, Some(local_entry(&normalized, false, data.len() as u64)), false);
+        }
         result
     }
 
+    async fn write_placeholder(&self, path: &str) -> Result<(), TbxError> {
+        // まだ送らない。中身が届いたら `write` で 1 回だけ送る。
+        self.note(path, Some(local_entry(path, false, 0)), true);
+        Ok(())
+    }
+
+    async fn commit_placeholder(&self, path: &str) -> Result<(), TbxError> {
+        // 中身が届かないまま確定した = 本当に空のファイル。
+        if self.is_placeholder(path) {
+            self.write(path, &[]).await?;
+        }
+        Ok(())
+    }
+
     async fn delete(&self, path: &str) -> Result<(), TbxError> {
+        if self.is_placeholder(path) {
+            self.note(path, None, false);
+            return Ok(());
+        }
         let result = self.api.delete(&[normalize_path(path)]).await.map(|_| ());
+        if result.is_ok() {
+            self.forget_under(path);
+            self.note(path, None, false);
+        }
         // 削除後は親の一覧キャッシュを捨てる。捨てないと、マウント直後の
         // 列挙で消したはずの項目が最大 TTL 秒だけ残る（実測で発生）。
         self.invalidate(&parent_path(path));
@@ -350,6 +497,14 @@ impl RemoteFs for TeraBoxFs {
             return Ok(());
         }
 
+        // 送る前の空ファイルの改名（エクスプローラーの「新規作成」→ 名前入力）。
+        // 行き先に空ファイルとして確定させる。
+        if self.is_placeholder(&from_n) {
+            self.note(&from_n, None, false);
+            return self.write(&to_n, &[]).await;
+        }
+
+        let moved = self.find(&from_n).await.ok().flatten();
         let from_parent = parent_path(&from_n);
         let to_parent = parent_path(&to_n);
         let new_name = to_n.rsplit('/').next().unwrap_or_default().to_string();
@@ -360,6 +515,12 @@ impl RemoteFs for TeraBoxFs {
         }
         self.invalidate(&from_parent);
         self.invalidate(&parent_path(&to_n));
+        self.forget_under(&from_n);
+        self.note(&from_n, None, false);
+        let mut entry = moved.unwrap_or_else(|| local_entry(&to_n, false, 0));
+        entry.path = to_n.clone();
+        entry.server_filename = base_name(&to_n);
+        self.note(&to_n, Some(entry), false);
         Ok(())
     }
 
@@ -367,6 +528,9 @@ impl RemoteFs for TeraBoxFs {
         let normalized = normalize_path(path);
         let result = self.api.create_dir(&normalized).await.map(|_| ());
         self.invalidate(&parent_path(&normalized));
+        if result.is_ok() {
+            self.note(&normalized, Some(local_entry(&normalized, true, 0)), false);
+        }
         result
     }
 }

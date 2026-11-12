@@ -63,6 +63,19 @@ pub trait RemoteFs: Send + Sync {
 
     /// ディレクトリ作成。
     async fn create_dir(&self, path: &str) -> Result<(), TbxError>;
+
+    /// 中身が後から届く空ファイルを用意する（WebDAV の PUT 0 バイト）。
+    ///
+    /// Windows は新しいファイルを書く前に、まず空のファイルを PUT してくる。
+    /// 既定では普通の書き込みと同じ。送らずに待てる実装はここで手元に留める。
+    async fn write_placeholder(&self, path: &str) -> Result<(), TbxError> {
+        self.write(path, &[]).await
+    }
+
+    /// `write_placeholder` で留めたままのファイルを確定させる（WebDAV の UNLOCK）。
+    async fn commit_placeholder(&self, _path: &str) -> Result<(), TbxError> {
+        Ok(())
+    }
 }
 
 /// `Arc<T>` をそのまま `RemoteFs` として扱えるようにする。
@@ -101,6 +114,14 @@ impl<T: RemoteFs + ?Sized> RemoteFs for std::sync::Arc<T> {
 
     async fn create_dir(&self, path: &str) -> Result<(), TbxError> {
         (**self).create_dir(path).await
+    }
+
+    async fn write_placeholder(&self, path: &str) -> Result<(), TbxError> {
+        (**self).write_placeholder(path).await
+    }
+
+    async fn commit_placeholder(&self, path: &str) -> Result<(), TbxError> {
+        (**self).commit_placeholder(path).await
     }
 }
 

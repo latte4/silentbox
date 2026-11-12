@@ -211,11 +211,14 @@ where
         "MOVE" => move_path(fs.as_ref(), &path, &req).await,
         "PROPPATCH" => proppatch(fs.as_ref(), &path, req).await,
         "LOCK" => lock(fs.as_ref(), &path).await,
-        "UNLOCK" => {
-            let mut resp = Response::new(empty_body());
-            *resp.status_mut() = StatusCode::NO_CONTENT;
-            resp
-        }
+        "UNLOCK" => match fs.commit_placeholder(&normalize_path(&path)).await {
+            Ok(()) => {
+                let mut resp = Response::new(empty_body());
+                *resp.status_mut() = StatusCode::NO_CONTENT;
+                resp
+            }
+            Err(e) => text_response(StatusCode::BAD_GATEWAY, &format!("{e}")),
+        },
         _ => text_response(StatusCode::METHOD_NOT_ALLOWED, "未対応のメソッドです"),
     };
 
@@ -678,7 +681,13 @@ where
             return text_response(StatusCode::BAD_REQUEST, &format!("本文を読めません: {e}"))
         }
     };
-    match fs.write(&p, &body).await {
+    // 新しいファイルの空 PUT は下準備。中身の PUT が続くので、ここでは送らない。
+    let result = if body.is_empty() && matches!(fs.metadata(&p).await, Ok(None)) {
+        fs.write_placeholder(&p).await
+    } else {
+        fs.write(&p, &body).await
+    };
+    match result {
         Ok(()) => {
             let mut resp = Response::new(empty_body());
             *resp.status_mut() = StatusCode::CREATED;
