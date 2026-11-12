@@ -621,7 +621,9 @@ impl ApiClient {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        let params = vec![
+        // 中身はフォーム本文で送る。block_list はブロック数に比例して長くなり、
+        // クエリに載せると 1GiB 程度で HTTP 414（Request-URI Too Large）になる（実測）。
+        let form = vec![
             ("path".to_string(), path.to_string()),
             ("size".to_string(), size.to_string()),
             ("isdir".to_string(), "0".to_string()),
@@ -629,7 +631,7 @@ impl ApiClient {
             ("block_list".to_string(), block),
             ("target_path".to_string(), path.to_string()),
         ];
-        let value: Value = self.post_form_json("/api/precreate", params, Vec::new()).await?;
+        let value: Value = self.post_form_json("/api/precreate", Vec::new(), form).await?;
 
         // 既に同一内容がある場合は `return_type=2` で `info` が返り、送信不要。
         let return_type = value.get("return_type").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -756,15 +758,16 @@ impl ApiClient {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        let params = vec![
-            ("a".to_string(), "commit".to_string()),
+        // precreate と同じ理由で、block_list を含む中身はフォーム本文で送る。
+        let params = vec![("a".to_string(), "commit".to_string())];
+        let form = vec![
             ("path".to_string(), path.to_string()),
             ("size".to_string(), size.to_string()),
             ("isdir".to_string(), "0".to_string()),
             ("uploadid".to_string(), upload_id.to_string()),
             ("block_list".to_string(), block),
         ];
-        self.post_form_json("/api/create", params, Vec::new()).await
+        self.post_form_json("/api/create", params, form).await
     }
 
     // ---- jsToken 再取得 ----
