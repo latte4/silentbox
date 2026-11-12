@@ -213,7 +213,13 @@ impl TeraBoxFs {
         }
         let parent = parent_path(&p);
         let name = base_name(&p);
-        let list = self.entries(&parent).await?;
+        // 親フォルダが無い（作成・名前変更の直後で未反映の場合を含む）なら、
+        // 子も「無い」と答える。エラーにすると Windows が操作を中断する。
+        let list = match self.entries(&parent).await {
+            Ok(list) => list,
+            Err(TbxError::Api(ref e)) if e.errno == -9 => return Ok(None),
+            Err(e) => return Err(e),
+        };
         Ok(list.into_iter().find(|e| e.display_name() == name))
     }
 }
@@ -344,25 +350,15 @@ impl RemoteFs for TeraBoxFs {
             return Ok(());
         }
 
-        // `/api/filemanager?opera=rename` は、どのパラメータ形でも `errno 2`
-        // （param err）を返した（実測: filelist を配列/オブジェクト、newname を
-        // 名前/絶対パス、async あり/なしの 6 通りを試した）。仕様を特定できて
-        // いないため推測で実装せず、読み出し→再アップロード→削除で代替する。
-        let meta = self
-            .metadata(&from_n)
-            .await?
-            .ok_or_else(|| TbxError::Other(format!("{from_n} が見つかりません")))?;
-
-        if meta.is_dir {
-            return Err(TbxError::Other(
-                "フォルダの名前変更は未対応です（API の仕様が未確定）".to_string(),
-            ));
+        let from_parent = parent_path(&from_n);
+        let to_parent = parent_path(&to_n);
+        let new_name = to_n.rsplit('/').next().unwrap_or_default().to_string();
+        if from_parent == to_parent {
+            self.api.rename(&from_n, &new_name).await?;
+        } else {
+            self.api.move_to(&from_n, &to_parent, &new_name).await?;
         }
-
-        let data = self.read(&from_n).await?;
-        self.write(&to_n, &data).await?;
-        self.api.delete(&[from_n.clone()]).await?;
-        self.invalidate(&parent_path(&from_n));
+        self.invalidate(&from_parent);
         self.invalidate(&parent_path(&to_n));
         Ok(())
     }

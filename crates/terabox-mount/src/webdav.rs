@@ -185,6 +185,20 @@ where
 {
     let method = req.method().clone();
     let path = percent_decode(req.uri().path());
+    let hdr = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string()
+    };
+    let detail = format!(
+        "depth={} dest={} overwrite={} len={}",
+        hdr("Depth"),
+        hdr("Destination"),
+        hdr("Overwrite"),
+        hdr("Content-Length")
+    );
 
     let response = match method.as_str() {
         "OPTIONS" => options_response(),
@@ -195,9 +209,17 @@ where
         "DELETE" => delete_path(fs.as_ref(), &path).await,
         "MKCOL" => mkcol(fs.as_ref(), &path).await,
         "MOVE" => move_path(fs.as_ref(), &path, &req).await,
+        "PROPPATCH" => proppatch(fs.as_ref(), &path, req).await,
+        "LOCK" => lock(fs.as_ref(), &path).await,
+        "UNLOCK" => {
+            let mut resp = Response::new(empty_body());
+            *resp.status_mut() = StatusCode::NO_CONTENT;
+            resp
+        }
         _ => text_response(StatusCode::METHOD_NOT_ALLOWED, "未対応のメソッドです"),
     };
 
+    tracing::debug!("{method} {path} {detail} -> {}", response.status().as_u16());
     Ok(response)
 }
 
@@ -220,7 +242,7 @@ fn options_response() -> Response<Body> {
     headers.insert("DAV", HeaderValue::from_static("1, 2"));
     headers.insert(
         "Allow",
-        HeaderValue::from_static("OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, MKCOL, MOVE"),
+        HeaderValue::from_static("OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MOVE, LOCK, UNLOCK"),
     );
     headers.insert("MS-Author-Via", HeaderValue::from_static("DAV"));
     resp
@@ -261,9 +283,28 @@ where
 
     let mut items: Vec<(String, Option<FsEntry>)> = Vec::new();
     match fs.metadata(&p).await {
-        Ok(Some(_)) => items.push((p.clone(), None)),
+        // 自身の行も実際の種類・サイズで返す（None だとフォルダ扱いになり、
+        // Windows が「同じ名前のフォルダがある」と誤解する）。
+        Ok(Some(meta)) => items.push((
+            p.clone(),
+            Some(FsEntry {
+                fs_id: meta.fs_id,
+                server_filename: String::new(),
+                path: meta.path,
+                isdir: meta.is_dir,
+                size: meta.size,
+                server_mtime: meta.mtime,
+                server_ctime: meta.mtime,
+                md5: String::new(),
+                thumbs: None,
+                category: None,
+            }),
+        )),
         Ok(None) => return text_response(StatusCode::NOT_FOUND, "見つかりません"),
-        Err(e) => return text_response(StatusCode::BAD_GATEWAY, &format!("{e}")),
+        Err(e) => {
+            tracing::debug!("PROPFIND {p} 失敗: {e}");
+            return text_response(StatusCode::BAD_GATEWAY, &format!("{e}"));
+        }
     }
 
     if depth == "1" {
@@ -281,6 +322,95 @@ where
         CONTENT_TYPE,
         HeaderValue::from_static("application/xml; charset=utf-8"),
     );
+    resp
+}
+
+/// 属性の書き込み。TeraBox には時刻や属性を書けないので、受け取ったことにして
+/// 成功を返す。Windows はフォルダ作成やコピーの直後に送ってきて、失敗すると
+/// 操作全体をエラーにする。
+async fn proppatch<B>(fs: &(dyn RemoteFs + Send + Sync), path: &str, req: Request<B>) -> Response<Body>
+where
+    B: HttpBody<Data = Bytes> + Send + 'static,
+    B::Error: std::fmt::Display,
+{
+    let p = normalize_path(path);
+    let body = match req.into_body().collect().await {
+        Ok(b) => String::from_utf8_lossy(&b.to_bytes()).to_string(),
+        Err(e) => {
+            return text_response(StatusCode::BAD_REQUEST, &format!("本文を読めません: {e}"))
+        }
+    };
+    let is_dir = matches!(fs.metadata(&p).await, Ok(Some(m)) if m.is_dir);
+
+    // 要求された Win32* 属性名を拾って、そのまま 200 で返す。
+    let mut names: Vec<String> = Vec::new();
+    for part in body.split('<').skip(1) {
+        let tag: String = part
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '>' && *c != '/')
+            .collect();
+        let local = tag.rsplit(':').next().unwrap_or("");
+        if local.starts_with("Win32") && !names.iter().any(|n| n == local) {
+            names.push(local.to_string());
+        }
+    }
+
+    let mut xml = String::from(
+        r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:"><D:response><D:href>"#,
+    );
+    xml.push_str(&encode_href(&p, is_dir));
+    xml.push_str("</D:href><D:propstat><D:prop>");
+    for n in &names {
+        xml.push_str(&format!("<Z:{n}/>"));
+    }
+    xml.push_str("</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>");
+
+    let mut resp = Response::new(boxed(Full::new(Bytes::from(xml))));
+    *resp.status_mut() = StatusCode::MULTI_STATUS;
+    resp.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/xml; charset=utf-8"),
+    );
+    resp
+}
+
+/// 鍵かけ。ローカル 1 人で使う前提なので実際には排他せず、常に成功を返す。
+/// `DAV: 1, 2` を名乗る以上、Windows はファイルを書く前に LOCK を送ってくる。
+async fn lock(fs: &(dyn RemoteFs + Send + Sync), path: &str) -> Response<Body> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+
+    let p = normalize_path(path);
+    let is_dir = matches!(fs.metadata(&p).await, Ok(Some(m)) if m.is_dir);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let token = format!(
+        "opaquelocktoken:tbx-{nanos:x}-{:x}",
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let xml = format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="utf-8"?><D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock>"#,
+            "<D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope>",
+            "<D:depth>0</D:depth><D:timeout>Second-3600</D:timeout>",
+            "<D:locktoken><D:href>{token}</D:href></D:locktoken>",
+            "<D:lockroot><D:href>{href}</D:href></D:lockroot>",
+            "</D:activelock></D:lockdiscovery></D:prop>"
+        ),
+        token = token,
+        href = encode_href(&p, is_dir)
+    );
+    let mut resp = Response::new(boxed(Full::new(Bytes::from(xml))));
+    *resp.status_mut() = StatusCode::OK;
+    resp.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/xml; charset=utf-8"),
+    );
+    if let Ok(v) = HeaderValue::from_str(&format!("<{token}>")) {
+        resp.headers_mut().insert("Lock-Token", v);
+    }
     resp
 }
 
@@ -607,7 +737,10 @@ where
             *resp.status_mut() = StatusCode::CREATED;
             resp
         }
-        Err(e) => text_response(StatusCode::BAD_GATEWAY, &format!("{e}")),
+        Err(e) => {
+            tracing::debug!("MOVE {path} -> {dest_path} 失敗: {e}");
+            text_response(StatusCode::BAD_GATEWAY, &format!("{e}"))
+        }
     }
 }
 

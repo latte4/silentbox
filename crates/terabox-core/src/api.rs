@@ -567,14 +567,40 @@ impl ApiClient {
 
     /// 名前変更。`to_name` は新しい名前だけ（ディレクトリ移動は含まない）。
     pub async fn rename(&self, from: &str, to_name: &str) -> Result<Value, TbxError> {
-        let form = vec![
-            (
-                "filelist".to_string(),
-                format!("[\"{}\"]", escape_json(from)),
+        // filelist は `{"path","newname"}` の配列。`async=2`（同期実行）を付けないと
+        // errno 2（param err）になる。
+        let form = vec![(
+            "filelist".to_string(),
+            format!(
+                "[{{\"path\":\"{}\",\"newname\":\"{}\"}}]",
+                escape_json(from),
+                escape_json(to_name)
             ),
-            ("newname".to_string(), to_name.to_string()),
+        )];
+        let params = vec![
+            ("async".to_string(), "2".to_string()),
+            ("onnest".to_string(), "fail".to_string()),
         ];
-        self.post_form_json("/api/filemanager?opera=rename", Vec::new(), form)
+        self.post_form_json("/api/filemanager?opera=rename", params, form)
+            .await
+    }
+
+    /// 別フォルダへ移動する（同時に名前も変えられる）。`dest_dir` は移動先フォルダ。
+    pub async fn move_to(&self, from: &str, dest_dir: &str, new_name: &str) -> Result<Value, TbxError> {
+        let form = vec![(
+            "filelist".to_string(),
+            format!(
+                "[{{\"path\":\"{}\",\"dest\":\"{}\",\"newname\":\"{}\"}}]",
+                escape_json(from),
+                escape_json(dest_dir),
+                escape_json(new_name)
+            ),
+        )];
+        let params = vec![
+            ("async".to_string(), "2".to_string()),
+            ("onnest".to_string(), "fail".to_string()),
+        ];
+        self.post_form_json("/api/filemanager?opera=move", params, form)
             .await
     }
 
