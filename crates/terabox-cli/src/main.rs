@@ -9,6 +9,7 @@ mod cdp;
 mod format;
 mod login;
 mod secret;
+mod split;
 mod walk;
 mod which;
 
@@ -140,6 +141,12 @@ enum Command {
         /// 保存名の上書き。
         #[arg(long)]
         name: Option<String>,
+        /// 4GiB を超える動画を分割しない（上限の大きい有料プラン向け）。
+        ///
+        /// 既定では、4GiB を超える動画を ffmpeg で時間ごとに区切り、
+        /// `名前-1.mp4`、`名前-2.mp4` … として送る（どれも単体で再生できる）。
+        #[arg(long)]
+        no_split: bool,
     },
     /// 共有リンクの中身を表示する。
     Share {
@@ -369,7 +376,12 @@ async fn run(cli: Cli) -> Result<()> {
             restart,
             jobs,
         } => cmd_get(&path, output, name, conn, restart, jobs, json).await,
-        Command::Put { local, remote, name } => cmd_put(local, &remote, name, json).await,
+        Command::Put {
+            local,
+            remote,
+            name,
+            no_split,
+        } => cmd_put(local, &remote, name, no_split, json).await,
         Command::Share { url, save, dest } => cmd_share(&url, save, &dest, json).await,
         Command::Play {
             path,
@@ -1124,30 +1136,77 @@ async fn download_folder(
     Ok(())
 }
 
-async fn cmd_put(local: PathBuf, remote: &str, name: Option<String>, json: bool) -> Result<()> {
+async fn cmd_put(
+    local: PathBuf,
+    remote: &str,
+    name: Option<String>,
+    no_split: bool,
+    json: bool,
+) -> Result<()> {
     if !local.exists() {
         bail!("{} が見つかりません。", local.display());
     }
+    let size = std::fs::metadata(&local)?.len();
+    let remote_dir = terabox_core::vfs::normalize_path(remote);
     let client = api().await?;
     let mut uploader = Uploader::new(client);
     let mut ledger = Ledger::open(&terabox_core::config::ledger_path()).map_err(|e| anyhow!(e))?;
 
-    let req = UploadRequest {
-        local_path: local.clone(),
-        remote_dir: terabox_core::vfs::normalize_path(remote),
-        remote_name: name,
-        part_size: 4 * 1024 * 1024,
-    };
+    // 上限を超える動画は、区切ってから部品ごとに送る。
+    // `TBX_SPLIT_LIMIT`（バイト）は試験用。小さいファイルで分割の流れを確かめる。
+    let limit = std::env::var("TBX_SPLIT_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(split::SINGLE_FILE_LIMIT);
+    if size > limit && !no_split {
+        if !split::is_video(&local) {
+            bail!(
+                "{} は {} で、1 ファイルの上限（無料プランは 4GiB）を超えています。分割して送れるのは動画だけです。",
+                local.display(),
+                format::bytes(size)
+            );
+        }
+        let base = name.clone().unwrap_or_else(|| {
+            local
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "video.mp4".to_string())
+        });
+        eprintln!(
+            "{} を超えているので、動画を分けてから送ります（画質はそのまま）...",
+            format::bytes(limit)
+        );
+        let work = split::make_work_dir(&local)?;
+        let parts = split::split_video(&local, &base, &work.path, limit)?;
+        eprintln!("{} 個に分けました。", parts.len());
 
-    let outcome = uploader
-        .upload(&req, &mut ledger, |p| match p {
-            Progress::Note(text) => eprintln!("{text}"),
-            other => eprint!("\r{}", format::progress_line(&other)),
-        })
-        .await;
-    eprintln!();
+        let mut done = Vec::new();
+        for (i, part) in parts.iter().enumerate() {
+            let part_name = part
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            eprintln!("[{}/{}] {part_name}", i + 1, parts.len());
+            let outcome = upload_one(&mut uploader, &mut ledger, part, &remote_dir, Some(part_name)).await?;
+            done.push(outcome);
+        }
+        drop(work);
 
-    let done = outcome.map_err(|e| anyhow!(e))?;
+        if json {
+            let list: Vec<_> = done
+                .iter()
+                .map(|d| serde_json::json!({"remote_path": d.remote_path, "bytes": d.bytes}))
+                .collect();
+            println!("{}", serde_json::json!({ "split": true, "parts": list }));
+        } else {
+            for d in &done {
+                println!("アップロードしました: {}", d.remote_path);
+            }
+        }
+        return Ok(());
+    }
+
+    let done = upload_one(&mut uploader, &mut ledger, &local, &remote_dir, name).await?;
     if json {
         println!(
             "{}",
@@ -1162,6 +1221,30 @@ async fn cmd_put(local: PathBuf, remote: &str, name: Option<String>, json: bool)
         println!("アップロードしました: {}", done.remote_path);
     }
     Ok(())
+}
+
+/// 1 ファイルを送る（進捗は標準エラーへ）。
+async fn upload_one(
+    uploader: &mut Uploader,
+    ledger: &mut Ledger,
+    local: &std::path::Path,
+    remote_dir: &str,
+    name: Option<String>,
+) -> Result<terabox_core::transfer::UploadOutcome> {
+    let req = UploadRequest {
+        local_path: local.to_path_buf(),
+        remote_dir: remote_dir.to_string(),
+        remote_name: name,
+        part_size: 4 * 1024 * 1024,
+    };
+    let outcome = uploader
+        .upload(&req, ledger, |p| match p {
+            Progress::Note(text) => eprintln!("{text}"),
+            other => eprint!("\r{}", format::progress_line(&other)),
+        })
+        .await;
+    eprintln!();
+    outcome.map_err(|e| anyhow!(e))
 }
 
 async fn cmd_share(url: &str, save: bool, dest: &str, json: bool) -> Result<()> {
