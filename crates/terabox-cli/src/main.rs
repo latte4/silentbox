@@ -8,6 +8,7 @@ mod autostart;
 mod cdp;
 mod format;
 mod login;
+mod putdir;
 mod secret;
 mod split;
 mod walk;
@@ -133,12 +134,12 @@ enum Command {
     },
     /// ファイルをアップロードする。
     Put {
-        /// ローカルファイル。
+        /// ローカルファイル、またはフォルダ（中身ごと `<保存先>/<フォルダ名>/` へ送る）。
         local: PathBuf,
         /// 保存先ディレクトリ。
         #[arg(long, default_value = "/")]
         remote: String,
-        /// 保存名の上書き。
+        /// 保存名の上書き（ファイルを 1 つ送るときだけ）。
         #[arg(long)]
         name: Option<String>,
         /// 4GiB を超える動画を分割しない（上限の大きい有料プラン向け）。
@@ -1146,10 +1147,9 @@ async fn cmd_put(
     if !local.exists() {
         bail!("{} が見つかりません。", local.display());
     }
-    let size = std::fs::metadata(&local)?.len();
     let remote_dir = terabox_core::vfs::normalize_path(remote);
     let client = api().await?;
-    let mut uploader = Uploader::new(client);
+    let mut uploader = Uploader::new(client.clone());
     let mut ledger = Ledger::open(&terabox_core::config::ledger_path()).map_err(|e| anyhow!(e))?;
 
     // 上限を超える動画は、区切ってから部品ごとに送る。
@@ -1158,6 +1158,16 @@ async fn cmd_put(
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(split::SINGLE_FILE_LIMIT);
+
+    if local.is_dir() {
+        if name.is_some() {
+            bail!("--name はファイルを 1 つ送るときだけ使えます。");
+        }
+        return put_dir(&client, &mut uploader, &mut ledger, &local, &remote_dir, limit, no_split, json)
+            .await;
+    }
+
+    let size = std::fs::metadata(&local)?.len();
     if size > limit && !no_split {
         if !split::is_video(&local) {
             bail!(
@@ -1172,26 +1182,7 @@ async fn cmd_put(
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "video.mp4".to_string())
         });
-        eprintln!(
-            "{} を超えているので、動画を分けてから送ります（画質はそのまま）...",
-            format::bytes(limit)
-        );
-        let work = split::make_work_dir(&local)?;
-        let parts = split::split_video(&local, &base, &work.path, limit)?;
-        eprintln!("{} 個に分けました。", parts.len());
-
-        let mut done = Vec::new();
-        for (i, part) in parts.iter().enumerate() {
-            let part_name = part
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            eprintln!("[{}/{}] {part_name}", i + 1, parts.len());
-            let outcome = upload_one(&mut uploader, &mut ledger, part, &remote_dir, Some(part_name)).await?;
-            done.push(outcome);
-        }
-        drop(work);
-
+        let done = upload_split(&mut uploader, &mut ledger, &local, &remote_dir, &base, limit).await?;
         if json {
             let list: Vec<_> = done
                 .iter()
@@ -1219,6 +1210,229 @@ async fn cmd_put(
         );
     } else {
         println!("アップロードしました: {}", done.remote_path);
+    }
+    Ok(())
+}
+
+/// 上限を超える動画を分けて、部品を順に送る。
+async fn upload_split(
+    uploader: &mut Uploader,
+    ledger: &mut Ledger,
+    local: &std::path::Path,
+    remote_dir: &str,
+    base: &str,
+    limit: u64,
+) -> Result<Vec<terabox_core::transfer::UploadOutcome>> {
+    eprintln!(
+        "{} を超えているので、動画を分けてから送ります（画質はそのまま）...",
+        format::bytes(limit)
+    );
+    let work = split::make_work_dir(local)?;
+    let parts = split::split_video(local, base, &work.path, limit)?;
+    eprintln!("{} 個に分けました。", parts.len());
+
+    let mut done = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let part_name = part
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        eprintln!("  部品 [{}/{}] {part_name}", i + 1, parts.len());
+        done.push(upload_one(uploader, ledger, part, remote_dir, Some(part_name)).await?);
+    }
+    drop(work);
+    Ok(done)
+}
+
+/// 送り続けても全部失敗するエラー（書き込みの一時停止・ログイン切れ）か。
+fn is_write_blocked(e: &anyhow::Error) -> bool {
+    let text = format!("{e:#}");
+    text.contains("errno 4000023") || text.contains("errno 450016") || text.contains("errno -6")
+}
+
+/// 分割したときの 1 個目の名前（`名前-1.mp4`）。
+fn first_part_name(name: &str) -> String {
+    let p = std::path::Path::new(name);
+    let stem = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    match p.extension() {
+        Some(ext) => format!("{stem}-1.{}", ext.to_string_lossy()),
+        None => format!("{stem}-1"),
+    }
+}
+
+/// リモートのフォルダ 1 つ分の名前（名前 -> フォルダかどうか）。
+type RemoteNames = std::collections::HashMap<String, bool>;
+
+/// `dir` の中の名前を返す（覚えておき経由）。作ったばかりのフォルダは中が空だと
+/// 分かっているので、サーバに聞かない（一覧への反映が遅れるため）。
+async fn remote_names(
+    client: &ApiClient,
+    listing: &mut std::collections::HashMap<String, RemoteNames>,
+    created: &std::collections::HashSet<String>,
+    dir: &str,
+) -> Result<RemoteNames> {
+    if let Some(hit) = listing.get(dir) {
+        return Ok(hit.clone());
+    }
+    let mut names = RemoteNames::new();
+    if !created.contains(dir) {
+        let mut page = 1;
+        loop {
+            match client.list(dir, page, 1000, "name", false).await {
+                Ok(resp) => {
+                    let n = resp.list.len();
+                    for e in resp.list {
+                        names.insert(e.display_name().to_string(), e.isdir);
+                    }
+                    if n < 1000 {
+                        break;
+                    }
+                    page += 1;
+                }
+                // まだ無いフォルダ。
+                Err(TbxError::Api(ref err)) if err.errno == -9 => break,
+                Err(e) => return Err(map_session_error(e)),
+            }
+        }
+    }
+    listing.insert(dir.to_string(), names.clone());
+    Ok(names)
+}
+
+/// フォルダを中身ごと送る。`C:\写真` → `<remote_dir>/写真/…`。
+///
+/// 同じ名前が既にあるファイルは飛ばす（`/api/create` は上書きせず別名を作るため、
+/// 送り直すと重複が増える）。これで、途中で止まっても同じコマンドで続きから送れる。
+#[allow(clippy::too_many_arguments)]
+async fn put_dir(
+    client: &ApiClient,
+    uploader: &mut Uploader,
+    ledger: &mut Ledger,
+    local: &std::path::Path,
+    remote_dir: &str,
+    limit: u64,
+    no_split: bool,
+    json: bool,
+) -> Result<()> {
+    use std::collections::{HashMap, HashSet};
+
+    let plan = putdir::plan(local, remote_dir)
+        .with_context(|| format!("{} を読めません", local.display()))?;
+    let total_bytes: u64 = plan.files.iter().map(|f| f.size).sum();
+    let root = plan.dirs.first().cloned().unwrap_or_else(|| remote_dir.to_string());
+    eprintln!(
+        "{} 件（{}）を {root} へ送ります。",
+        plan.files.len(),
+        format::bytes(total_bytes)
+    );
+
+    let mut listing: HashMap<String, RemoteNames> = HashMap::new();
+    let mut created: HashSet<String> = HashSet::new();
+
+    // フォルダを浅い順に用意する。
+    for dir in &plan.dirs {
+        let parent = terabox_core::vfs::parent_path(dir);
+        let name = terabox_core::vfs::base_name(dir);
+        let names = remote_names(client, &mut listing, &created, &parent).await?;
+        match names.get(&name) {
+            Some(true) => {}
+            Some(false) => bail!("{dir} と同じ名前のファイルが既にあるため、フォルダを作れません。"),
+            None => {
+                client.create_dir(dir).await.map_err(map_session_error)?;
+                created.insert(dir.clone());
+                listing.entry(parent).or_default().insert(name, true);
+            }
+        }
+    }
+
+    let mut sent = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
+    let count = plan.files.len();
+
+    for (i, f) in plan.files.iter().enumerate() {
+        eprintln!("[{}/{count}] {}", i + 1, f.display);
+        let names = remote_names(client, &mut listing, &created, &f.remote_dir).await?;
+        let over = f.size > limit;
+        let will_split = over && !no_split && split::is_video(&f.local);
+
+        let check_name = if will_split { first_part_name(&f.name) } else { f.name.clone() };
+        if names.contains_key(&check_name) {
+            eprintln!("  既にあるので飛ばします");
+            skipped.push(f.display.clone());
+            continue;
+        }
+
+        let result = if over && !will_split {
+            Err(anyhow!(
+                "{} で、1 ファイルの上限（無料プランは 4GiB）を超えています{}",
+                format::bytes(f.size),
+                if no_split { "" } else { "（分割して送れるのは動画だけです）" }
+            ))
+        } else if will_split {
+            upload_split(uploader, ledger, &f.local, &f.remote_dir, &f.name, limit)
+                .await
+                .map(|_| ())
+        } else {
+            upload_one(uploader, ledger, &f.local, &f.remote_dir, Some(f.name.clone()))
+                .await
+                .map(|_| ())
+        };
+
+        match result {
+            Ok(()) => {
+                sent += 1;
+                listing.entry(f.remote_dir.clone()).or_default().insert(check_name, false);
+            }
+            Err(e) if is_write_blocked(&e) => {
+                eprintln!("  失敗: {e}");
+                eprintln!(
+                    "TeraBox に書き込みを止められたため、残り {} 件は中止します。",
+                    count - i - 1
+                );
+                failed.push((f.display.clone(), e.to_string()));
+                break;
+            }
+            Err(e) => {
+                eprintln!("  失敗: {e}");
+                failed.push((f.display.clone(), e.to_string()));
+            }
+        }
+    }
+
+    if json {
+        let failed_json: Vec<_> = failed
+            .iter()
+            .map(|(p, e)| serde_json::json!({"path": p, "error": e}))
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "remote_root": root,
+                "sent": sent,
+                "skipped": skipped,
+                "failed": failed_json,
+            })
+        );
+    } else {
+        println!();
+        println!(
+            "送った: {sent} 件 / 既にあって飛ばした: {} 件 / 失敗: {} 件",
+            skipped.len(),
+            failed.len()
+        );
+        for (p, e) in &failed {
+            println!("  失敗 {p}: {e}");
+        }
+    }
+    if !failed.is_empty() {
+        bail!(
+            "{} 件を送れませんでした。もう一度同じコマンドを実行すると、送れていない分だけを送り直します。",
+            failed.len()
+        );
     }
     Ok(())
 }
