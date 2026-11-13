@@ -194,6 +194,8 @@ impl ApiClient {
         // errno が 0 以外なら業務エラーとして返す。
         if let Some(errno) = value.get("errno").and_then(|v| v.as_i64()) {
             if errno != 0 {
+                // 本人確認の要求などは、errmsg 以外の項目に手がかりが入ることがある。
+                tracing::debug!("{path} が errno {errno} を返しました: {}", head(&body, 2000));
                 return Err(TbxError::Api(ApiError {
                     endpoint: path.to_string(),
                     errno,
